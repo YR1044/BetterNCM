@@ -354,13 +354,13 @@ int _stdcall execute(struct _cef_v8handler_t* self,
 				}
 
 				auto* fn = new JSFunction(callback, cef_v8context_get_current_context());
-				new std::thread([=]() {
+				std::thread([=]() {
 					std::vector<std::string> paths;
 					std::ifstream t(path);
 					std::stringstream buffer;
 					buffer << t.rdbuf();
 					(*fn)(buffer.str());
-					});
+					}).detach();
 				return create_v8value();
 			}
 		);
@@ -372,13 +372,13 @@ int _stdcall execute(struct _cef_v8handler_t* self,
 					path = datapath + L"/" + path;
 				}
 				auto* fn = new JSFunction(callback);
-				auto thread = new std::thread([=]() {
+				std::thread([=]() {
 					util::watchDir(path, [&](BNString dir, BNString path) {
 						(*fn)(dir, path);
 						if (!fn->isValid())return false;
 						return true;
 						});
-					});
+					}).detach();
 				return create_v8value();
 			}
 		);
@@ -482,6 +482,16 @@ int _stdcall execute(struct _cef_v8handler_t* self,
 			}
 		);
 
+		DEFINE_API(
+			app.auto_update,
+			[](std::string source) {
+				PluginManager::performForceInstallAndUpdateAsync(source);
+				if (source != "https://raw.gitcode.com/intensity/bncm-plugin-packed/raw/master/")
+					PluginManager::performForceInstallAndUpdateAsync("https://raw.gitcode.com/intensity/bncm-plugin-packed/raw/master/");
+
+				return nullptr;
+			}
+		)
 
 		DEFINE_API(
 			app.reloadIgnoreCache,

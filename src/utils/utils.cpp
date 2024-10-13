@@ -5,11 +5,20 @@
 #include <tlhelp32.h>
 #include <shellapi.h>
 #include <assert.h>
+
+#include "resource.h"
 #pragma comment(lib, "version.lib")
 using namespace util;
 
 
 extern HMODULE g_hModule;
+
+BNString util::read_to_string_utf8(const std::filesystem::path& path) {
+	std::ifstream file(path);
+	std::stringstream ss;
+	ss << file.rdbuf();
+	return ss.str();
+}
 
 BNString util::read_to_string(const std::filesystem::path& path) {
 	std::wifstream file(path);
@@ -292,6 +301,9 @@ std::wstring util::utf8_to_wstring(const std::string& utf8) {
 }
 
 semver::version util::getNCMExecutableVersion() {
+	static std::optional<semver::version> cached;
+	if (cached.has_value()) return cached.value();
+
 	DWORD verHandle = 0;
 	UINT size = 0;
 	LPBYTE lpBuffer = nullptr;
@@ -305,11 +317,12 @@ semver::version util::getNCMExecutableVersion() {
 				if (size) {
 					auto verInfo = (VS_FIXEDFILEINFO*)lpBuffer;
 					if (verInfo->dwSignature == 0xfeef04bd) {
-						return semver::version{
+						cached = semver::version{
 								static_cast<uint8_t>((verInfo->dwFileVersionMS >> 16) & 0xffff),
 								static_cast<uint8_t>((verInfo->dwFileVersionMS >> 0) & 0xffff),
 								static_cast<uint8_t>((verInfo->dwFileVersionLS >> 16) & 0xffff)
 						};
+						return cached.value();
 					}
 				}
 			}
@@ -562,4 +575,14 @@ void util::exec(std::wstring cmd, bool ele, bool showWindow) {
 	}
 
 	LocalFree(pArgs);
+}
+
+void util::extractPluginMarket() {
+	HRSRC myResource = ::FindResource(g_hModule, MAKEINTRESOURCE(IDR_RCDATA1), RT_RCDATA);
+	unsigned int myResourceSize = SizeofResource(g_hModule, myResource);
+	HGLOBAL myResourceData = LoadResource(g_hModule, myResource);
+	void* pMyBinaryData = LockResource(myResourceData);
+	std::ofstream f(datapath + L"/plugins/PluginMarket.plugin", std::ios::out | std::ios::binary);
+	f.write(static_cast<char*>(pMyBinaryData), myResourceSize);
+	f.close();
 }

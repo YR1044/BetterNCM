@@ -3,11 +3,11 @@
 #include <string>
 #include <vector>
 
-
 #define NATIVE_PLUGIN_CPP_EXTENSIONS
 #include <BetterNCMNativePlugin.h>
 #include <variant>
 #include <utils/BNString.hpp>
+
 
 
 struct PluginNativeAPI {
@@ -62,6 +62,8 @@ struct PluginManifest {
 	std::string betterncm_version;
 	std::string preview;
 	std::string startup_script;
+	bool ncm3Compatible;
+	std::string ncm_version_req;
 
 	std::map<std::string, std::vector<std::map<std::string, std::string>>> injects;
 	HijackVersionMap hijacks;
@@ -108,7 +110,7 @@ struct RemotePlugin {
 class PluginManager {
 	static std::vector<std::shared_ptr<Plugin>> loadInPath(const std::wstring& path);
 	static std::vector<std::shared_ptr<Plugin>> packedPlugins;
-	static void performForceInstallAndUpdateSync(const std::string& source);
+	static void performForceInstallAndUpdateSync(const std::string& source, bool isRetried = false);
 public:
 	static void performForceInstallAndUpdateAsync(const std::string& source);
 	static void loadAll();
@@ -118,6 +120,7 @@ public:
 	static std::vector<std::shared_ptr<Plugin>> getDevPlugins();
 	static std::vector<std::shared_ptr<Plugin>> getAllPlugins();
 	static std::vector<std::shared_ptr<Plugin>> getPackedPlugins();
+	static std::vector<std::string> getDisableList();
 };
 
 using BetterNCMPluginMainFunc = int(*)(BetterNCMNativePlugin::PluginAPI*);

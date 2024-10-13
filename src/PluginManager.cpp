@@ -69,6 +69,8 @@ void from_json(const nlohmann::json& j, PluginManifest& p) {
 	p.preview = j.value("preview", "unknown");
 	p.injects = j.value("injects", std::map<std::string, std::vector<std::map<std::string, std::string>>>());
 	p.startup_script = j.value("startup_script", "startup_script.js");
+	p.ncm3Compatible = j.value("ncm3-compatible", false);
+	p.ncm_version_req = j.value("ncm-version-req", "> 2.10.2");
 
 	p.hijacks.clear();
 	if (j.count("hijacks")) {
@@ -149,16 +151,23 @@ Plugin::~Plugin() {
 }
 
 void Plugin::loadNativePluginDll(NCMProcessType processType) {
+
 	if (manifest.native_plugin[0] != '\0') {
 		try {
 			HMODULE hDll = LoadLibrary((runtime_path / manifest.native_plugin).wstring().c_str());
 			if (!hDll) {
-				throw "dll doesn't exists.";
+				const fs::path x64path = runtime_path / fs::path(manifest.native_plugin).parent_path() / (fs::path(manifest.native_plugin).filename().string() + ".x64.dll");
+				std::cout << "NativePlugin x64path: " << (x64path.string());
+				hDll = LoadLibrary(x64path.wstring().c_str());
+			}
+
+			if (!hDll) {
+				throw std::exception("dll doesn't exists or is not adapted to this arch.");
 			}
 
 			auto BetterNCMPluginMain = (BetterNCMPluginMainFunc)GetProcAddress(hDll, "BetterNCMPluginMain");
 			if (!BetterNCMPluginMain) {
-				throw "dll is not a betterncm plugin dll.";
+				throw std::exception("dll is not a betterncm plugin dll");
 			}
 
 
@@ -174,7 +183,7 @@ void Plugin::loadNativePluginDll(NCMProcessType processType) {
 		}
 		catch (std::exception& e) {
 			util::write_file_text(datapath.utf8() + "/log.log",
-				std::string("\n[" + manifest.slug + "]Plugin Native Plugin load Error: ") + (e.
+				std::string("\n[" + manifest.slug + "] Plugin Native Plugin load Error: ") + (e.
 					what()), true);
 		}
 	}
@@ -183,15 +192,15 @@ void Plugin::loadNativePluginDll(NCMProcessType processType) {
 std::optional<std::string> Plugin::getStartupScript()
 {
 	if(fs::exists(runtime_path / manifest.startup_script))
-		return util::read_to_string(runtime_path / manifest.startup_script);
+		return util::read_to_string_utf8(runtime_path / manifest.startup_script).utf8();
 	return std::nullopt;
 }
 
 void PluginManager::performForceInstallAndUpdateAsync(const std::string& source)
 {
-	new std::thread([source]() {
+	std::thread([source]() {
 		performForceInstallAndUpdateSync(source);
-	});
+	}).detach();
 }
 
 void PluginManager::loadAll() {
@@ -211,7 +220,7 @@ void PluginManager::loadRuntime() {
 void PluginManager::extractPackedPlugins() {
 	util::write_file_text(datapath + L"/PLUGIN_EXTRACTING_LOCK.lock", "");
 
-
+	const auto disable_list = PluginManager::getDisableList();
 
 	if (fs::exists(datapath + L"/plugins_runtime")) {
 		for (auto file : fs::directory_iterator(datapath + L"/plugins_runtime")) {
@@ -235,30 +244,69 @@ void PluginManager::extractPackedPlugins() {
 	}
 
 	fs::create_directories(datapath + L"/plugins_runtime");
+	static const bool isNCM3 = util::getNCMExecutableVersion().major == 3;
 
 	for (auto file : fs::directory_iterator(datapath + L"/plugins")) {
 		BNString path = file.path().wstring();
 		if (path.endsWith(L".plugin")) {
 			try {
-				int result = zip_extract(path.utf8().c_str(),
-					BNString(datapath + L"/plugins_runtime/tmp").utf8().c_str(), nullptr, nullptr);
-				if (result != 0)throw std::exception(("unzip err code:" + std::to_string(GetLastError())).c_str());
 
 				PluginManifest manifest;
-				auto modManifest = nlohmann::json::parse(
-					util::read_to_string(datapath + L"/plugins_runtime/tmp/manifest.json"));
-				modManifest.get_to(manifest);
+
+				const auto extractPlugin = [&]() {
+					if(fs::exists(datapath.utf8() + "/plugins_runtime/tmp")) 
+						fs::remove_all(datapath.utf8() + "/plugins_runtime/tmp");
+					
+					const auto zip = zip_open(path.utf8().c_str(), 0, 'r');
+					
+					auto code = zip_entry_open(zip, "manifest.json");
+					if (code < 0) throw std::exception("manifest.json not found in plugin");
+
+					char* buf = nullptr;
+					size_t size = 0;
+					code = zip_entry_read(zip, (void**) & buf, &size);
+					if (code < 0) throw std::exception("manifest.json read error");
+					zip_entry_close(zip);
+					zip_close(zip);
+
+					const auto modManifest = nlohmann::json::parse(std::string(buf, size));
+					modManifest.get_to(manifest);
+					};
+
+				extractPlugin();
+				if (manifest.name == "PluginMarket") {
+					if (semver::version(manifest.version) < semver::version("0.7.2")) {
+						util::extractPluginMarket();
+						extractPlugin();
+					}
+				}
+
+				if (std::ranges::find(disable_list, manifest.slug) != disable_list.end() ||
+					(
+					isNCM3 &&
+					!manifest.ncm3Compatible // duplicated / ncm3 but not ncm3-compatible / do not meet version req
+					) ||
+					(
+						!semver::range::satisfies(
+							util::getNCMExecutableVersion(), manifest.ncm_version_req
+						)
+					)
+					) {
+					continue;
+				}
 
 				if (manifest.manifest_version == 1) {
-					util::write_file_text(datapath + L"/plugins_runtime/tmp/.plugin.path.meta",
-						pystring::slice(path, datapath.length()));
-					auto realPath = datapath + L"/plugins_runtime/" + BNString(manifest.slug);
+					BNString realPath = datapath + L"/plugins_runtime/" + BNString(manifest.slug);
 
 					std::error_code ec;
-					if (fs::exists(realPath) && manifest.native_plugin[0] == '\0')
-						fs::remove_all(realPath, ec);
+					if (fs::exists(realPath.utf8()) && manifest.native_plugin[0] == '\0')
+						fs::remove_all(realPath.utf8(), ec);
 
-					fs::rename(datapath + L"/plugins_runtime/tmp", realPath);
+					const auto code = zip_extract(path.utf8().c_str(), realPath.utf8().c_str(), nullptr, nullptr);
+					if (code != 0) throw std::exception(("unzip err code:" + std::to_string(code)).c_str());
+
+					util::write_file_text(realPath + L"/.plugin.path.meta",
+						pystring::slice(path, datapath.length()));
 				}
 				else {
 					throw std::exception("Unsupported manifest version.");
@@ -281,7 +329,7 @@ std::vector<std::shared_ptr<Plugin>> PluginManager::getDevPlugins()
 }
 
 
-std::vector<std::shared_ptr<Plugin>> PluginManager::getAllPlugins()
+std::vector<std::shared_ptr<Plugin>> PluginManager::getAllPlugins() 
 {
 	std::vector<std::shared_ptr<Plugin>> tmp = getPackedPlugins();
 	auto devPlugins = getDevPlugins();
@@ -305,6 +353,27 @@ std::vector<std::shared_ptr<Plugin>> PluginManager::getPackedPlugins()
 	return PluginManager::packedPlugins;
 }
 
+std::vector<std::string> PluginManager::getDisableList()
+{
+	std::vector<std::string> disable_list;
+	std::ifstream file(datapath + L"/disable_list.txt");
+	if (!file.is_open()) {
+		return disable_list;
+	}
+
+	std::string line;
+	while (std::getline(file, line)) {
+		// Trim leading and trailing white space characters
+		auto isspace = [](char c) { return std::isspace(static_cast<unsigned char>(c)); };
+		line.erase(line.begin(), std::find_if_not(line.begin(), line.end(), isspace));
+		line.erase(std::find_if_not(line.rbegin(), line.rend(), isspace).base(), line.end());
+
+		disable_list.push_back(line);
+	}
+	file.close();
+	return disable_list;
+}
+
 std::vector<std::shared_ptr<Plugin>> PluginManager::loadInPath(const std::wstring& path) {
 	std::vector<std::shared_ptr<Plugin>> plugins;
 	if (fs::exists(path))
@@ -315,7 +384,7 @@ std::vector<std::shared_ptr<Plugin>> PluginManager::loadInPath(const std::wstrin
 					PluginManifest manifest;
 					json.get_to(manifest);
 
-					std::optional<std::filesystem::path> packed_file_path=std::nullopt;
+					std::optional<std::filesystem::path> packed_file_path = std::nullopt;
 					auto plugin_meta_path = file.path() / ".plugin.path.meta";
 					if (fs::exists(plugin_meta_path)) packed_file_path = util::read_to_string(plugin_meta_path);
 					plugins.push_back(std::make_shared<Plugin>(manifest, file.path(), packed_file_path));
@@ -323,7 +392,7 @@ std::vector<std::shared_ptr<Plugin>> PluginManager::loadInPath(const std::wstrin
 			}
 			catch (std::exception& e) {
 				util::write_file_text(datapath.utf8() + "log.log",
-					std::string("\n[" + file.path().string() + "]Plugin Native load Error: ") + (e.
+					std::string("\n[" + file.path().string() + "] Plugin Native load Error: ") + (e.
 						what()), true);
 			}
 		}
@@ -331,7 +400,7 @@ std::vector<std::shared_ptr<Plugin>> PluginManager::loadInPath(const std::wstrin
 	return plugins;
 }
 
-void PluginManager::performForceInstallAndUpdateSync(const std::string& source)
+void PluginManager::performForceInstallAndUpdateSync(const std::string& source, bool isRetried)
 {
 	try {
 		const auto body = util::FetchWebContent(source + "plugins.json");
@@ -347,11 +416,10 @@ void PluginManager::performForceInstallAndUpdateSync(const std::string& source)
 
 			// output log
 			std::cout << "\n[ BetterNCM ] [Plugin Remote Tasks] Plugin " << remote_plugin.slug
-				<< " FI: " << (remote_plugin.force_install ? "true" : "false") << " FUni: " << (remote_plugin.force_uninstall ? "true" : "false")
+			    << " FUni: " << (remote_plugin.force_uninstall ? "true" : "false")
 				<< " FUpd: " << remote_plugin.force_update << "\n";
 
 			if (local != local_plugins.end()) {
-
 				auto localVer = (*local)->manifest.version;
 				std::cout << "\t\tlocal: " << localVer << "\n\t\t - at " << (*local)->runtime_path << std::endl;
 
@@ -383,21 +451,16 @@ void PluginManager::performForceInstallAndUpdateSync(const std::string& source)
 					}
 				}
 			}
-			else if (remote_plugin.force_install) {
-				std::cout << "[ BetterNCM ] [Plugin Remote Tasks] Remote plugin " << remote_plugin.slug << std::endl;
-				std::cout << "\t\t - Force install: Downloading...\n";
-				util::DownloadFile(source + remote_plugin.file_url, datapath + L"/plugins/" + BNString(remote_plugin.file));
-				std::cout << "\t\t - Force install performed.\n";
-				std::cout << std::endl;
-			}
 		}
 	}
 	catch (std::exception& e) {
-		if(source == "https://gitee.com/microblock/BetterNCMPluginsMarketData/raw/master/") {
+		if(isRetried) {
 			std::cout << "[ BetterNCM ] [Plugin Remote Tasks] Failed to check update on " << source << ": " << e.what() << "." << std::endl;
 		}else {
+			const auto onlineConfig = util::FetchWebContent("https://microblock.cc/bncm-config.txt");
+			const auto marketConf = onlineConfig.split(L"\n")[0];
 			std::cout << "[ BetterNCM ] [Plugin Remote Tasks] Failed to check update on " << source << ": " << e.what() << " , fallbacking to default..." << std::endl;
-			performForceInstallAndUpdateSync("https://gitee.com/microblock/BetterNCMPluginsMarketData/raw/master/");
+			performForceInstallAndUpdateSync(BNString(marketConf).utf8(), true);
 		}
 		
 	}
